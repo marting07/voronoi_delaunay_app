@@ -727,7 +727,13 @@ class View3D(QWidget):
 
             if segs:
                 pos = np.array(segs, dtype=np.float32)
-                self._delaunay_item = gl.GLLinePlotItem(pos=pos, mode="lines", width=1, antialias=True)
+                self._delaunay_item = gl.GLLinePlotItem(
+                    pos=pos,
+                    color=(0.86, 0.86, 0.86, 1.0),
+                    mode="lines",
+                    width=1,
+                    antialias=True,
+                )
                 self.glw.addItem(self._delaunay_item)
 
         # Voronoi skeleton: connect circumcenters of adjacent tets (share face)
@@ -750,7 +756,13 @@ class View3D(QWidget):
 
             if segs:
                 pos = np.array(segs, dtype=np.float32)
-                self._voronoi_item = gl.GLLinePlotItem(pos=pos, mode="lines", width=2, antialias=True)
+                self._voronoi_item = gl.GLLinePlotItem(
+                    pos=pos,
+                    color=(0.27, 0.67, 1.0, 1.0),
+                    mode="lines",
+                    width=2,
+                    antialias=True,
+                )
                 self.glw.addItem(self._voronoi_item)
 
 
