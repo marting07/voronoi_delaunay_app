@@ -27,11 +27,11 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from PyQt6.QtCore import Qt, QRectF
+from PyQt6.QtCore import Qt, QRectF, QThread, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
     QApplication,
@@ -55,6 +55,15 @@ import pyqtgraph.opengl as gl
 # ----------------------------
 # Geometry helpers (2D)
 # ----------------------------
+
+class GenerationCancelled(Exception):
+    pass
+
+
+def _check_cancelled(cancelled: Optional[Callable[[], bool]]):
+    if cancelled is not None and cancelled():
+        raise GenerationCancelled
+
 
 def orient2d(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     # Positive if c is to the left of directed segment a->b
@@ -107,7 +116,8 @@ def ray_box_intersection(origin: np.ndarray, direction: np.ndarray, box: Tuple[f
     """
     Clip a ray to an axis-aligned box.
     box = (xmin, ymin, xmax, ymax)
-    Returns the far intersection point (first hit in forward direction) or None.
+    Returns the forward exit point, even when the origin is outside the box.
+    Returns None if the ray misses the box or has no direction.
     """
     xmin, ymin, xmax, ymax = box
     ox, oy = origin
@@ -138,14 +148,11 @@ def ray_box_intersection(origin: np.ndarray, direction: np.ndarray, box: Tuple[f
         tmin = max(tmin, t1)
         tmax = min(tmax, t2)
 
-    if tmax < tmin:
+    if tmax < tmin or not math.isfinite(tmax):
         return None
 
-    # We want the first forward intersection that is >= 0
-    t = tmin if tmin >= 0 else tmax
-    if t < 0:
-        return None
-    return origin + direction * t
+    # tmin is zero for interior origins; tmax reaches the actual boundary.
+    return origin + direction * tmax
 
 
 # ----------------------------
@@ -169,82 +176,8 @@ class Delaunay2D:
         """
         self.points = points.astype(np.float64, copy=False)
 
-    @staticmethod
-    def _super_triangle(points: np.ndarray) -> np.ndarray:
-        # Create a super triangle that covers all points.
-        xmin, ymin = points.min(axis=0)
-        xmax, ymax = points.max(axis=0)
-        dx = xmax - xmin
-        dy = ymax - ymin
-        d = max(dx, dy)
-        cx = (xmin + xmax) / 2.0
-        cy = (ymin + ymax) / 2.0
-
-        # Big triangle around bounding box
-        p1 = np.array([cx - 20 * d, cy - 20 * d], dtype=np.float64)
-        p2 = np.array([cx, cy + 30 * d], dtype=np.float64)
-        p3 = np.array([cx + 20 * d, cy - 20 * d], dtype=np.float64)
-        return np.vstack([p1, p2, p3])
-
-    def build(self) -> List[Tri2]:
-        pts = self.points
-        if len(pts) < 3:
-            return []
-
-        super_pts = self._super_triangle(pts)
-        pts_all = np.vstack([pts, super_pts])
-        n = len(pts)
-        s0, s1, s2 = n, n + 1, n + 2
-
-        # Start with super triangle (ensure CCW)
-        a, b, c = s0, s1, s2
-        if orient2d(pts_all[a], pts_all[b], pts_all[c]) < 0:
-            b, c = c, b
-        tris: List[Tri2] = [Tri2(a, b, c)]
-
-        for pi in range(n):
-            p = pts_all[pi]
-
-            bad: List[Tri2] = []
-            for t in tris:
-                A, B, C = pts_all[t.a], pts_all[t.b], pts_all[t.c]
-                # Make sure (A,B,C) is CCW for incircle sign
-                if orient2d(A, B, C) < 0:
-                    A, C = C, A
-                if incircle(A, B, C, p) > 0:
-                    bad.append(t)
-
-            if not bad:
-                continue
-
-            # Boundary edges: edges that appear exactly once among bad triangles
-            edge_count: Dict[Tuple[int, int], int] = {}
-            def add_edge(u: int, v: int):
-                key = (u, v) if u < v else (v, u)
-                edge_count[key] = edge_count.get(key, 0) + 1
-
-            bad_set = set(bad)
-            new_tris = [t for t in tris if t not in bad_set]
-            for t in bad:
-                add_edge(t.a, t.b)
-                add_edge(t.b, t.c)
-                add_edge(t.c, t.a)
-
-            boundary = [e for e, cnt in edge_count.items() if cnt == 1]
-
-            # Retriangulate the hole
-            for (u, v) in boundary:
-                # Build triangle (u, v, pi) and keep it CCW
-                A, B, C = pts_all[u], pts_all[v], p
-                if orient2d(A, B, C) < 0:
-                    u, v = v, u
-                new_tris.append(Tri2(u, v, pi))
-
-            tris = new_tris
-
-        # Remove triangles touching super triangle vertices
-        final_tris = [t for t in tris if (t.a < n and t.b < n and t.c < n)]
-        return final_tris
+    def build(self, cancelled: Optional[Callable[[], bool]] = None) -> List[Tri2]:
+        return [Tri2(*vertices) for vertices in _delaunay_simplices(self.points, 2, cancelled)]
 
     @staticmethod
     def triangle_adjacency(tris: List[Tri2]) -> Dict[Tuple[int, int], List[int]]:
@@ -309,6 +242,108 @@ def circumcenter3d(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -
 
 
 # ----------------------------
+# Incremental Delaunay with an explicit convex hull (2D and 3D)
+# ----------------------------
+
+def _simplex_orientation(vertices: np.ndarray) -> float:
+    if vertices.shape[1] == 2:
+        return orient2d(*vertices)
+    return orient3d(*vertices)
+
+
+def _initial_simplex(points: np.ndarray) -> List[int]:
+    """Pick vertices successively farthest from the current affine span."""
+    seed = [0]
+    residuals = points - points[0]
+    for _ in range(points.shape[1]):
+        lengths = np.linalg.norm(residuals, axis=1)
+        index = int(np.argmax(lengths))
+        if lengths[index] <= 64 * np.finfo(np.float64).eps:
+            return []
+        direction = residuals[index] / lengths[index]
+        seed.append(index)
+        residuals = residuals - (residuals @ direction)[:, None] * direction
+        residuals[seed] = 0.0
+    return seed
+
+
+def _delaunay_simplices(
+    points: np.ndarray, dimension: int, cancelled: Optional[Callable[[], bool]] = None
+) -> List[Tuple[int, ...]]:
+    """Rebuild finite conflicts and visible hull facets without super vertices."""
+    _check_cancelled(cancelled)
+    if len(points) < dimension + 1:
+        return []
+
+    # A uniform similarity transform improves predicate conditioning and keeps
+    # the returned indices in the caller's original point array.
+    span = float(np.max(np.ptp(points, axis=0)))
+    if span == 0.0:
+        return []
+    coords = (points - points.min(axis=0)) / span
+    seed = _initial_simplex(coords)
+    if not seed:
+        return []
+    if _simplex_orientation(coords[seed]) < 0:
+        seed[0], seed[1] = seed[1], seed[0]
+
+    simplices = [tuple(seed)]
+    seen = {tuple(coords[i]) for i in seed}
+    for pi, point in enumerate(coords):
+        _check_cancelled(cancelled)
+        key = tuple(point)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        vertices = coords[np.asarray(simplices)]
+        shifted = vertices - point
+        matrix = np.concatenate(
+            [shifted, np.sum(shifted * shifted, axis=2)[..., None]], axis=2
+        )
+        # With positively oriented simplices, the translated determinant is
+        # positive inside a 2D circle and negative inside a 3D sphere.
+        determinants = np.linalg.det(matrix) * (1 if dimension == 2 else -1)
+        tolerance = 64 * np.finfo(np.float64).eps * np.prod(
+            np.linalg.norm(matrix, axis=2), axis=1
+        )
+        bad = determinants > tolerance
+
+        facets: Dict[Tuple[int, ...], List[Tuple[int, int]]] = {}
+        for sid, simplex in enumerate(simplices):
+            for j, opposite in enumerate(simplex):
+                facet = tuple(sorted(simplex[:j] + simplex[j + 1:]))
+                facets.setdefault(facet, []).append((sid, opposite))
+
+        additions = []
+        for facet, owners in facets.items():
+            if len(owners) == 2:
+                if bad[owners[0][0]] == bad[owners[1][0]]:
+                    continue
+                orientation = _simplex_orientation(coords[list(facet) + [pi]])
+            else:
+                sid, opposite = owners[0]
+                orientation = _simplex_orientation(coords[list(facet) + [pi]])
+                interior_side = _simplex_orientation(coords[list(facet) + [opposite]])
+                visible = (orientation > 0) != (interior_side > 0)
+                # Hull facets act as infinite cells: visible ones join the
+                # conflict zone. Only its boundary receives new finite cells.
+                if bool(bad[sid]) == visible:
+                    continue
+
+            if orientation == 0.0:
+                continue
+            simplex = list(facet) + [pi]
+            if orientation < 0:
+                simplex[0], simplex[1] = simplex[1], simplex[0]
+            additions.append(tuple(simplex))
+
+        simplices = [s for sid, s in enumerate(simplices) if not bad[sid]] + additions
+
+    return simplices
+
+
+# ----------------------------
 # Delaunay 3D (Bowyer–Watson)
 # ----------------------------
 
@@ -327,94 +362,8 @@ class Delaunay3D:
     def __init__(self, points: np.ndarray):
         self.points = points.astype(np.float64, copy=False)
 
-    @staticmethod
-    def _super_tet(points: np.ndarray) -> np.ndarray:
-        # Huge tetrahedron that encloses points
-        mn = points.min(axis=0)
-        mx = points.max(axis=0)
-        c = (mn + mx) / 2.0
-        d = float(np.max(mx - mn))
-        if d < 1e-9:
-            d = 1.0
-
-        # 4 points far away
-        p0 = c + np.array([0, 0, 40 * d], dtype=np.float64)
-        p1 = c + np.array([0, 30 * d, -20 * d], dtype=np.float64)
-        p2 = c + np.array([26 * d, -15 * d, -20 * d], dtype=np.float64)
-        p3 = c + np.array([-26 * d, -15 * d, -20 * d], dtype=np.float64)
-        return np.vstack([p0, p1, p2, p3])
-
-    def build(self) -> List[Tet]:
-        pts = self.points
-        if len(pts) < 4:
-            return []
-
-        super_pts = self._super_tet(pts)
-        pts_all = np.vstack([pts, super_pts])
-        n = len(pts)
-        s0, s1, s2, s3 = n, n + 1, n + 2, n + 3
-
-        # Start with super tet; ensure positive orientation
-        tet = Tet(s0, s1, s2, s3)
-        A, B, C, D = pts_all[tet.a], pts_all[tet.b], pts_all[tet.c], pts_all[tet.d]
-        if orient3d(A, B, C, D) < 0:
-            tet = Tet(tet.a, tet.c, tet.b, tet.d)
-
-        tets: List[Tet] = [tet]
-
-        for pi in range(n):
-            p = pts_all[pi]
-
-            bad: List[Tet] = []
-            for t in tets:
-                A, B, C, D = pts_all[t.a], pts_all[t.b], pts_all[t.c], pts_all[t.d]
-                # Ensure positive orientation for insphere sign convention
-                if orient3d(A, B, C, D) < 0:
-                    B, C = C, B
-                # insphere sign depends on orientation; with float det in standard form:
-                # We'll do a pragmatic approach: compute circumcenter and compare radius (faster, stable enough for random points)
-                cc = circumcenter3d(A, B, C, D)
-                if cc is None:
-                    continue
-                r2 = float(np.sum((cc - A) ** 2))
-                if float(np.sum((cc - p) ** 2)) <= r2 * (1.0 + 1e-12):
-                    bad.append(t)
-
-            if not bad:
-                continue
-
-            bad_set = set(bad)
-            new_tets = [t for t in tets if t not in bad_set]
-
-            # Boundary faces: appear exactly once among bad tets
-            face_count: Dict[Tuple[int, int, int], int] = {}
-
-            def add_face(u: int, v: int, w: int):
-                key = tuple(sorted((u, v, w)))
-                face_count[key] = face_count.get(key, 0) + 1
-
-            for t in bad:
-                add_face(t.a, t.b, t.c)
-                add_face(t.a, t.b, t.d)
-                add_face(t.a, t.c, t.d)
-                add_face(t.b, t.c, t.d)
-
-            boundary_faces = [f for f, cnt in face_count.items() if cnt == 1]
-
-            # Retetrahedralize cavity: connect point to each boundary face
-            for (u, v, w) in boundary_faces:
-                # Need consistent orientation: (u,v,w,pi) positive
-                A, B, C, D = pts_all[u], pts_all[v], pts_all[w], p
-                if orient3d(A, B, C, D) < 0:
-                    # swap v and w
-                    v, w = w, v
-                new_tets.append(Tet(u, v, w, pi))
-
-            tets = new_tets
-
-        # Remove any tets touching super vertices
-        final = [t for t in tets if (t.a < n and t.b < n and t.c < n and t.d < n)]
-        return final
+    def build(self, cancelled: Optional[Callable[[], bool]] = None) -> List[Tet]:
+        return [Tet(*vertices) for vertices in _delaunay_simplices(self.points, 3, cancelled)]
 
     @staticmethod
     def face_adjacency(tets: List[Tet]) -> Dict[Tuple[int, int, int], List[int]]:
@@ -440,11 +389,15 @@ class Delaunay3D:
 # Utility: random points with filtering
 # ----------------------------
 
-def random_points_2d(n: int, seed: int, min_dist: float = 1e-3) -> np.ndarray:
+def random_points_2d(
+    n: int, seed: int, min_dist: float = 1e-3,
+    *, cancelled: Optional[Callable[[], bool]] = None,
+) -> np.ndarray:
     rng = random.Random(seed)
     pts: List[Tuple[float, float]] = []
     tries = 0
     while len(pts) < n and tries < n * 200:
+        _check_cancelled(cancelled)
         tries += 1
         x, y = rng.random(), rng.random()
         ok = True
@@ -457,11 +410,15 @@ def random_points_2d(n: int, seed: int, min_dist: float = 1e-3) -> np.ndarray:
     return np.array(pts, dtype=np.float64)
 
 
-def random_points_3d(n: int, seed: int, min_dist: float = 2e-2) -> np.ndarray:
+def random_points_3d(
+    n: int, seed: int, min_dist: float = 2e-2,
+    *, cancelled: Optional[Callable[[], bool]] = None,
+) -> np.ndarray:
     rng = random.Random(seed)
     pts: List[Tuple[float, float, float]] = []
     tries = 0
     while len(pts) < n and tries < n * 400:
+        _check_cancelled(cancelled)
         tries += 1
         x, y, z = rng.random(), rng.random(), rng.random()
         ok = True
@@ -770,10 +727,109 @@ class View3D(QWidget):
 # Tabs
 # ----------------------------
 
-class Tab2D(QWidget):
-    def __init__(self):
+class GeometryWorker(QThread):
+    succeeded = pyqtSignal(object, object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, dimension: int, n: int, seed: int, parent: QWidget):
+        super().__init__(parent)
+        self.dimension = dimension
+        self.n = n
+        self.seed = seed
+
+    def run(self):
+        try:
+            generate = random_points_2d if self.dimension == 2 else random_points_3d
+            builder = Delaunay2D if self.dimension == 2 else Delaunay3D
+            points = generate(self.n, self.seed, cancelled=self.isInterruptionRequested)
+            simplices = builder(points).build(cancelled=self.isInterruptionRequested)
+            if not self.isInterruptionRequested():
+                self.succeeded.emit(points, simplices)
+        except GenerationCancelled:
+            pass
+        except Exception as error:
+            self.failed.emit(str(error) or type(error).__name__)
+
+
+class GenerationTab(QWidget):
+    generation_finished = pyqtSignal()
+
+    def __init__(self, dimension: int):
         super().__init__()
+        self.dimension = dimension
+        self._worker: Optional[GeometryWorker] = None
+        self._closing = False
+        self._close_pending = False
+        self.status_label = QLabel()
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.status_label.setWordWrap(True)
+
+    @property
+    def is_generating(self) -> bool:
+        return self._worker is not None
+
+    def _set_busy(self, busy: bool):
+        for control in (self.n_spin, self.seed_spin, self.btn_gen):
+            control.setEnabled(not busy)
+        self.btn_gen.setText("Generating..." if busy else "Regenerate")
+
+    @pyqtSlot()
+    def regenerate(self):
+        if self.is_generating or self._closing:
+            return
+        self._set_busy(True)
+        self.status_label.setText("Generating...")
+        self._worker = GeometryWorker(
+            self.dimension, int(self.n_spin.value()), int(self.seed_spin.value()), self
+        )
+        self._worker.succeeded.connect(self._generation_ready)
+        self._worker.failed.connect(self._generation_failed)
+        self._worker.finished.connect(self._generation_finished)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.start()
+
+    @pyqtSlot(object, object)
+    def _generation_ready(self, points: np.ndarray, simplices: list):
+        if self._closing:
+            return
+        self._display.set_data(points, simplices)
+        kind = "triangles" if self.dimension == 2 else "tetrahedra"
+        self.status_label.setText(f"{len(points)} points, {len(simplices)} {kind}.")
+
+    @pyqtSlot(str)
+    def _generation_failed(self, message: str):
+        if not self._closing:
+            self.status_label.setText(f"Generation failed: {message}")
+
+    @pyqtSlot()
+    def _generation_finished(self):
+        self._worker = None
+        if not self._closing:
+            self._set_busy(False)
+        if self._close_pending:
+            self.close()
+        self.generation_finished.emit()
+
+    def stop_generation(self):
+        self._closing = True
+        if self._worker is not None:
+            self.status_label.setText("Cancelling generation...")
+            self._worker.requestInterruption()
+
+    def closeEvent(self, event):
+        if self.is_generating:
+            event.ignore()
+            self._close_pending = True
+            self.stop_generation()
+        else:
+            super().closeEvent(event)
+
+
+class Tab2D(GenerationTab):
+    def __init__(self):
+        super().__init__(2)
         self.canvas = Canvas2D()
+        self._display = self.canvas
 
         self.n_spin = QSpinBox()
         self.n_spin.setRange(3, 3000)
@@ -805,6 +861,7 @@ class Tab2D(QWidget):
         controls.addRow("Show", toggles)
 
         controls.addRow(self.btn_gen)
+        controls.addRow(self.status_label)
 
         left = QWidget()
         left.setLayout(controls)
@@ -823,22 +880,12 @@ class Tab2D(QWidget):
     def _flags_changed(self):
         self.canvas.set_flags(self.cb_points.isChecked(), self.cb_delaunay.isChecked(), self.cb_voronoi.isChecked())
 
-    def regenerate(self):
-        n = int(self.n_spin.value())
-        seed = int(self.seed_spin.value())
-        pts = random_points_2d(n, seed)
 
-        delaunay = Delaunay2D(pts)
-        tris = delaunay.build()
-
-        self.canvas.set_data(pts, tris)
-        self._flags_changed()
-
-
-class Tab3D(QWidget):
+class Tab3D(GenerationTab):
     def __init__(self):
-        super().__init__()
+        super().__init__(3)
         self.view = View3D()
+        self._display = self.view
 
         self.n_spin = QSpinBox()
         self.n_spin.setRange(4, 400)
@@ -870,6 +917,7 @@ class Tab3D(QWidget):
         controls.addRow("Show", toggles)
 
         controls.addRow(self.btn_gen)
+        controls.addRow(self.status_label)
 
         left = QWidget()
         left.setLayout(controls)
@@ -888,17 +936,6 @@ class Tab3D(QWidget):
     def _flags_changed(self):
         self.view.set_flags(self.cb_points.isChecked(), self.cb_delaunay.isChecked(), self.cb_voronoi.isChecked())
 
-    def regenerate(self):
-        n = int(self.n_spin.value())
-        seed = int(self.seed_spin.value())
-        pts = random_points_3d(n, seed)
-
-        delaunay = Delaunay3D(pts)
-        tets = delaunay.build()
-
-        self.view.set_data(pts, tets)
-        self._flags_changed()
-
 
 # ----------------------------
 # Main window
@@ -907,14 +944,40 @@ class Tab3D(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._closing = False
         self.setWindowTitle("Voronoi + Delaunay (2D & 3D) — from scratch (learning-grade)")
 
         tabs = QTabWidget()
-        tabs.addTab(Tab2D(), "2D")
-        tabs.addTab(Tab3D(), "3D")
+        self._tabs = (Tab2D(), Tab3D())
+        for tab, title in zip(self._tabs, ("2D", "3D")):
+            tabs.addTab(tab, title)
+            tab.generation_finished.connect(self._finish_close)
 
         self.setCentralWidget(tabs)
         self.resize(1200, 700)
+
+    def closeEvent(self, event):
+        if any(tab.is_generating for tab in self._tabs):
+            event.ignore()
+            self._closing = True
+            for tab in self._tabs:
+                tab.stop_generation()
+        else:
+            super().closeEvent(event)
+
+    @pyqtSlot()
+    def _finish_close(self):
+        if self._closing and not any(tab.is_generating for tab in self._tabs):
+            self.close()
+
+    @pyqtSlot()
+    def shutdown_workers(self):
+        # aboutToQuit also covers quitting without a window close event.
+        for tab in self._tabs:
+            tab.stop_generation()
+        for tab in self._tabs:
+            if tab._worker is not None:
+                tab._worker.wait()
 
 
 def main():
@@ -923,6 +986,7 @@ def main():
     pg.setConfigOptions(antialias=True)
 
     w = MainWindow()
+    app.aboutToQuit.connect(w.shutdown_workers)
     w.show()
     app.exec()
 
